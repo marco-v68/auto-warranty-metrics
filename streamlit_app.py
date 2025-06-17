@@ -1,523 +1,430 @@
-import streamlit as st
+%%writefile data_processing.py
 import pandas as pd
-from datetime import datetime
-import os
-import plotly.express as px # For advanced visualizations
-import plotly.graph_objects as go # For more control over heatmaps if needed
-from typing import Optional # Required for type hinting in data_processing
-from sklearn.preprocessing import MinMaxScaler # For heatmap data normalization
-import numpy as np # Import numpy for inf handling
+from datetime import datetime, timedelta
+import numpy as np # Import numpy as it's used in some functions
+from typing import Optional # <--- ADDED THIS LINE
 
-# Import your functions from the separate files
-# Ensure these files (data_processing.py, safety_stock_logic.py) are in your GitHub repo
-from data_processing import (
-    load_and_clean,
-    generate_sku_kpi_table,
-    generate_customer_kpi_table,
-    generate_location_kpi_table,
-    generate_state_kpi_table,
-    generate_monthly_kpi_table,
-    generate_category_kpi_table,
-    generate_item_class_kpi_table,
-    generate_item_type_kpi_table,
-    generate_service_center_kpi_table
-)
-from safety_stock_logic import generate_safety_stock_table
+def clean_currency(val):
+    """Strip $ and commas, convert to float."""
+    if pd.isna(val):
+        return 0.0
+    return float(str(val).replace('$','').replace(',','').strip())
 
-st.set_page_config(layout="wide", page_title="Inventory & Warranty Analytics", initial_sidebar_state="expanded")
+def avg_days_between(dates: pd.Series) -> float:
+    """Average days between successive dates in a Series."""
+    diffs = dates.sort_values().diff().dt.days.dropna()
+    return diffs.mean() if not diffs.empty else 0.0
 
+def load_and_clean(input_csv_path: str) -> pd.DataFrame:
+    """Loads raw CSV, cleans it, and adds initial derived columns."""
+    df = pd.read_csv(input_csv_path, parse_dates=["txn_date"])
+    df = df.drop_duplicates()
+    # fulfillment_country
+    df["fulfillment_country"] = (
+        df["fulfillment_loc"].astype(str).str.upper().str.strip()
+        .apply(lambda x: "US" if x.startswith("H") else "Canada")
+    )
+    # clean numeric
+    df["item_rate"]     = df["item_rate"].apply(clean_currency)
+    df["item_qty"]      = pd.to_numeric(df["item_qty"], errors="coerce").fillna(0)
+    df["txn_amount"]    = df["txn_amount"].apply(clean_currency)
+    df["hstk_std_cost"] = df["hstk_std_cost"].apply(clean_currency)
+    # GL tag
+    df["GL_tag"] = df["txn_amount"].abs().gt(0.01).map({True:"GL", False:"No GL"})
+    # per-line metrics
+    df["cogs_per_unit"]   = df["hstk_std_cost"]
+    df["refund_per_unit"] = df.apply(
+        lambda r: (r["txn_amount"]/r["item_qty"]) if r["item_qty"] else 0.0, axis=1
+    )
+    df["net_cost_impact"] = df["cogs_per_unit"]*df["item_qty"] + df["txn_amount"]
+    # extra KPIs for lines
+    df["unit_margin_impact"]      = df["item_rate"] - df["hstk_std_cost"]
+    df["margin_efficiency_ratio"] = df.apply(
+        lambda r: (r["unit_margin_impact"]/r["item_rate"]) if r["item_rate"] else 0.0,
+        axis=1
+    )
+    df["margin_bleed_ratio"]      = df.apply(
+        lambda r: abs(r["net_cost_impact"])/(r["unit_margin_impact"]*r["item_qty"])
+                     if (r["unit_margin_impact"]*r["item_qty"]) else 0.0,
+        axis=1
+    )
+    df["margin_loss_intensity"]   = df.apply(
+        lambda r: abs(r["net_cost_impact"])/r["item_qty"] if r["item_qty"] else 0.0,
+        axis=1
+    )
+    return df
 
-# --- Custom Styling for a Cleaner Look ---
-st.markdown("""
-<style>
-    /* General body styling */
-    body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
-        background-color: #f0f2f6; /* Light gray background */
-        color: #333333;
-    }
+def generate_sku_kpi_table(cleaned_df: pd.DataFrame,
+                           kpi_csv_path: str,
+                           as_of: Optional[datetime]=None) -> pd.DataFrame:
+    if as_of is None:
+        as_of = datetime.now()
+    start = as_of.replace(month=1, day=1)
+    last90 = as_of - timedelta(days=90)
+    days_ytd = max((as_of - start).days, 1)
 
-    /* Streamlit's main content block - adjusting width and centering */
-    .st-emotion-cache-1r6dm7m { /* This is a common class for the main content wrapper */
-        padding-top: 2rem;
-        padding-right: 3rem;
-        padding-left: 3rem;
-        padding-bottom: 2rem;
-        /* Remove explicit max-width here; rely on layout="wide" for initial width */
-        /* You can adjust padding-left/right for more internal spacing if needed */
-    }
-    
-    /* Ensure the main app content fills available width in wide mode */
-    .st-emotion-cache-z5fcl4 { /* Sidebar width */
-        width: 250px;
-    }
+    df_ytd = cleaned_df[cleaned_df["txn_date"] >= start]
+    df_90d = cleaned_df[cleaned_df["txn_date"] >= last90]
 
-    .st-emotion-cache-h4xjwx { /* Button styling */
-        background-color: #007aff; /* Apple Blue */
-        color: white;
-        border-radius: 8px;
-        border: none;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        transition: background-color 0.2s, box-shadow 0.2s;
-    }
-    .st-emotion-cache-h4xjwx:hover {
-        background-color: #005bb5;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-    }
-    
-    .st-emotion-cache-1v0mbdj { /* Metric container */
-        background-color: #ffffff;
-        border-radius: 12px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-        padding: 1.5rem;
-    }
-    
-    .st-emotion-cache-1xv01z2 { /* Metric value */
-        color: #007aff; /* Apple Blue for values */
-        font-size: 2.2em;
-        font-weight: 700;
-    }
-    
-    .st-emotion-cache-czk5ad { /* Selectbox / Input field */
-        border-radius: 8px;
-        border: 1px solid #e0e0e0;
-        box-shadow: inset 0 1px 3px rgba(0,0,0,0.05);
-        padding: 0.5rem;
-    }
-
-    /* Expander styling */
-    .st-emotion-cache-p2fwss { /* Expander header */
-        border-radius: 8px;
-        background-color: #ffffff;
-        border: 1px solid #e0e0e0;
-        padding: 0.75rem 1rem;
-        font-weight: 600;
-        color: #333333;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-    }
-    .st-emotion-cache-p2fwss:hover {
-        background-color: #f9f9f9;
-    }
-    .st-emotion-cache-p2fwss > div { /* Adjust padding inside expander header */
-        padding: 0 !important; 
-    }
-    .st-emotion-cache-1aw8d9y { /* Expander content area */
-        border: 1px solid #e0e0e0;
-        border-top: none;
-        border-radius: 0 0 8px 8px;
-        background-color: #ffffff;
-        padding: 1rem;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-    }
-
-    /* Tabs styling */
-    .st-emotion-cache-l9bibm { /* Tab buttons container */
-        background-color: #ffffff;
-        border-radius: 8px;
-        padding: 0.5rem;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-    }
-    .st-emotion-cache-1cpx6a9 { /* Individual tab button */
-        border-radius: 6px;
-        font-weight: 500;
-    }
-    .st-emotion-cache-1cpx6a9.st-emotion-cache-1cpx6a9-hover { /* Hover state for tab */
-        background-color: #e5e5ea;
-    }
-    .st-emotion-cache-1cpx6a9.st-emotion-cache-1cpx6a9-selected { /* Selected tab */
-        background-color: #007aff !important;
-        color: white !important;
-    }
-    .st-emotion-cache-1q1n064 { /* Tab content area */
-        background-color: #ffffff;
-        border-radius: 8px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-        padding: 1.5rem;
-        margin-top: 1rem;
-    }
-    
-    /* Headers */
-    h1, h2, h3, h4, h5, h6 {
-        color: #1a1a1a;
-        font-weight: 700;
-    }
-    h1 { font-size: 2.5em; }
-    h2 { font-size: 2em; }
-    h3 { font-size: 1.5em; }
-
-</style>
-""", unsafe_allow_html=True)
-
-# Main container for the entire app content to ensure consistent padding and max-width
-# Removed max-width from st-emotion-cache-1r6dm7m and adding a wrapper div in markdown
-st.markdown('<div class="app-container">', unsafe_allow_html=True)
-
-st.title("Comprehensive Inventory & Warranty Analytics")
-
-# --- 1. Data Upload & Cleaning (Collapsible) ---
-with st.expander("1. Data Upload & Cleaning", expanded=True):
-    st.write("Upload your `warranty_raw.csv` file here to begin the analysis.")
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv", help="Please upload your raw warranty data in CSV format.")
-
-    if 'cleaned_df' not in st.session_state:
-        st.session_state.cleaned_df = pd.DataFrame()
-
-    if uploaded_file is not None:
-        # Save the uploaded file to a known path
-        input_file_path = "uploaded_warranty_raw.csv"
-        with open(input_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"File '{uploaded_file.name}' uploaded successfully!")
-
-        # Load and clean the data
-        with st.spinner("Cleaning and processing raw data..."):
-            st.session_state.cleaned_df = load_and_clean(input_file_path)
-        
-        if not st.session_state.cleaned_df.empty:
-            st.success("Data cleaned and ready for analysis! Preview below.")
-            st.dataframe(st.session_state.cleaned_df.head(), use_container_width=True)
-        else:
-            st.error("Data cleaning resulted in an empty DataFrame. Please check your raw data and ensure it's correctly formatted.")
-    else:
-        st.info("No file uploaded yet. Please upload your `warranty_raw.csv` to proceed.")
-
-
-# --- Only proceed if cleaned_df is available ---
-if st.session_state.cleaned_df.empty:
-    st.warning("Please upload a CSV file and ensure data is cleaned to proceed with analysis.")
-    st.stop()
-
-
-# --- 2. Analysis Parameters ---
-st.header("2. Analysis Parameters")
-as_of_date = st.date_input("Analysis 'As Of' Date", datetime.now(), help="Set the date for 'Year-to-Date' and 'Last 90 Days' calculations.")
-as_of_datetime = datetime.combine(as_of_date, datetime.min.time())
-
-
-# --- 3. Generate KPIs and Safety Stock ---
-st.header("3. Generate KPI Reports & Safety Stock")
-
-output_paths = {
-    "safety_stock_output.csv": "Safety Stock Data",
-    "sku_kpi_output.csv": "SKU KPIs",
-    "customer_kpi_output.csv": "Customer KPIs",
-    "location_kpi_output.csv": "Location KPIs",
-    "state_kpi_output.csv": "State KPIs",
-    "monthly_kpi_output.csv": "Monthly KPIs",
-    "category_kpi_output.csv": "Customer Category KPIs",
-    "item_class_kpi_output.csv": "Item Class KPIs",
-    "item_type_kpi_output.csv": "Item Type KPIs",
-    "service_center_kpi_output.csv": "Service Center KPIs"
-}
-
-if 'generated_dfs' not in st.session_state:
-    st.session_state.generated_dfs = {}
-
-if st.button("Run All Analysis & Generate Reports", help="Click to generate all KPI tables and safety stock recommendations."):
-    with st.spinner("Generating all KPI reports and Safety Stock data... This may take a few moments."):
-        # Generate Safety Stock Table
-        safety_stock_df = generate_safety_stock_table(
-            cleaned_df=st.session_state.cleaned_df,
-            safety_csv_path=list(output_paths.keys())[0],
-            as_of=as_of_datetime
+    def agg(df, label):
+        return df.groupby("item_sku").agg(
+            **{f"{label}_claims": ("doc_num","count"),
+               f"{label}_net_cost": ("net_cost_impact","sum")}
         )
-        st.session_state.generated_dfs['safety_stock_output.csv'] = safety_stock_df
 
-        # Generate other KPI Tables
-        st.session_state.generated_dfs['sku_kpi_output.csv'] = generate_sku_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[1], as_of=as_of_datetime)
-        st.session_state.generated_dfs['customer_kpi_output.csv'] = generate_customer_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[2], as_of=as_of_datetime)
-        st.session_state.generated_dfs['location_kpi_output.csv'] = generate_location_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[3], as_of=as_of_datetime)
-        st.session_state.generated_dfs['state_kpi_output.csv'] = generate_state_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[4], as_of=as_of_datetime)
-        st.session_state.generated_dfs['monthly_kpi_output.csv'] = generate_monthly_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[5], as_of=as_of_datetime)
-        st.session_state.generated_dfs['category_kpi_output.csv'] = generate_category_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[6])
-        st.session_state.generated_dfs['item_class_kpi_output.csv'] = generate_item_class_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[7])
-        st.session_state.generated_dfs['item_type_kpi_output.csv'] = generate_item_type_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[8])
-        st.session_state.generated_dfs['service_center_kpi_output.csv'] = generate_service_center_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[9])
-        
-    st.success("Analysis complete! Proceed to view results.")
+    kpi = agg(df_ytd, "YTD").join(agg(df_90d, "90D"), how="outer").fillna(0)
 
+    stats = pd.DataFrame(index=cleaned_df["item_sku"].unique(), dtype=float)
+    stats.index.name = "item_sku"
+    stats["sku_share_of_loss"]           = cleaned_df.groupby("item_sku")["net_cost_impact"].sum() / cleaned_df["net_cost_impact"].sum()
+    stats["sku_transaction_count"]       = cleaned_df.groupby("item_sku").size()
+    stats["sku_gl_transaction_count"]    = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("item_sku").size()
+    stats["sku_credit_memo_count"]       = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("item_sku").size()
+    stats["sku_invoice_count"]           = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("item_sku").size()
+    stats["total_sku_cost"]              = cleaned_df.groupby("item_sku")["net_cost_impact"].sum()
+    stats["credit_memo_velocity_gl_only"]= stats["sku_credit_memo_count"] / days_ytd
+    stats["invoice_velocity_gl_only"]    = stats["sku_invoice_count"]     / days_ytd
+    stats["loss_per_touchpoint"]         = stats["total_sku_cost"] / stats["sku_transaction_count"]
+    stats["sku_customer_recurrence"]     = cleaned_df.groupby("item_sku")["customer_name"].nunique()
 
-    # --- Display Results & Reports (Only if data generated) ---
-    if st.session_state.get('generated_dfs') and not st.session_state.generated_dfs['safety_stock_output.csv'].empty:
-        st.header("4. Analysis Results & Reports")
+    cm = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"]
+    stats["avg_credit_memo_cost_per_sku"] = cm.groupby("item_sku")["net_cost_impact"].mean().fillna(0)
+    stats["avg_days_between_failures_per_sku"] = cm.groupby("item_sku")["txn_date"].apply(avg_days_between)
+    stats["failure_cost_per_unit_failed"] = cm.groupby("item_sku").apply(
+        lambda g: g["net_cost_impact"].sum()/g["item_qty"].sum() if g["item_qty"].sum() else 0
+    )
+    cpi = cm.groupby(["item_sku","customer_name"])["doc_num"].count().pow(2)
+    stats["customer_pain_index"] = cpi.groupby("item_sku").sum()
+    stats["gl_bleed_density"]    = stats["total_sku_cost"] / stats["sku_gl_transaction_count"]
 
-        # --- Bloomberg Terminal Style - Key Metrics at the Top (for Safety Stock) ---
-        st.subheader("Safety Stock Executive Summary")
-        safety_stock_results_df = st.session_state.generated_dfs['safety_stock_output.csv']
-        
-        col1, col2, col3 = st.columns(3)
-        total_ss_value = safety_stock_results_df['total_safety_stock_value'].sum()
-        col1.metric("Total Safety Stock Value", f"${total_ss_value:,.2f}", help="Total calculated value of recommended safety stock across all items and locations.")
+    td = cleaned_df.copy()
+    td["days_since"] = (as_of - td["txn_date"]).dt.days
+    stats["time_weighted_sku_cost_velocity"] = td.groupby("item_sku").apply(
+        lambda g: (g["net_cost_impact"] * g["days_since"]).sum() / days_ytd
+    )
+    total_qty = cleaned_df.groupby("item_sku")["item_qty"].sum()
+    stats["cost_per_unit_moved"] = stats["total_sku_cost"] / total_qty
 
-        critical_items_count = safety_stock_results_df[
-            safety_stock_results_df['item_specific_z'] == 2.33
-        ].shape[0]
-        col2.metric("High Criticality Items (99% Service)", f"{critical_items_count}", help="Number of SKUs/locations with the highest business criticality (99% target service level).")
+    kpi = kpi.reset_index().merge(stats.reset_index(), on="item_sku", how="left")
+    kpi.to_csv(kpi_csv_path, index=False)
+    return kpi
 
-        avg_s_score = safety_stock_results_df['S_score'].mean()
-        col3.metric("Average S-Score (Overall Risk)", f"{avg_s_score:.2f}", help="Average composite risk score, higher indicates higher overall risk for an item/location.")
+def generate_customer_kpi_table(cleaned_df: pd.DataFrame,
+                                 cust_csv_path: str,
+                                 as_of: Optional[datetime]=None) -> pd.DataFrame:
+    if as_of is None:
+        as_of = datetime.now()
+    start = as_of.replace(month=1, day=1)
+    last90 = as_of - timedelta(days=90)
 
-        st.markdown("---") # Separator
+    df_ytd = cleaned_df[cleaned_df["txn_date"] >= start]
+    df_90d = cleaned_df[cleaned_df["txn_date"] >= last90]
 
+    def agg(df, label):
+        return df.groupby("customer_name").agg(
+            **{f"{label}_claims": ("doc_num","count"),
+               f"{label}_net_cost":("net_cost_impact","sum")}
+        )
 
-        # --- Tabs for Detailed Reports and Visualizations ---
-        tab_overview, tab_data, tab_visuals = st.tabs(["Overview & Key Visuals", "Detailed Reports", "Advanced Visualizations"])
+    cust = agg(df_ytd, "YTD").join(agg(df_90d, "90D"), how="outer").fillna(0)
 
-        with tab_overview:
-            st.subheader("Overview & Key Visuals")
-            st.write("Quick insights and standard charts for safety stock data.")
+    stats = pd.DataFrame(index=cleaned_df["customer_name"].unique(), dtype=float)
+    stats.index.name = "customer_name"
+    stats["total_customer_cost"]           = cleaned_df.groupby("customer_name")["net_cost_impact"].sum()
+    stats["total_units_serviced"]          = cleaned_df.groupby("customer_name")["item_qty"].sum()
+    stats["customer_transaction_count"]    = cleaned_df.groupby("customer_name").size()
+    stats["customer_gl_transaction_count"] = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("customer_name").size()
+    stats["customer_credit_memo_count"]    = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("customer_name").size()
+    stats["customer_invoice_count"]        = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("customer_name").size()
+    stats["customer_avg_cost_per_unit"]    = stats["total_customer_cost"] / stats["total_units_serviced"].replace(0,1)
+    stats["customer_avg_margin_loss"]      = cleaned_df.groupby("customer_name")["margin_loss_intensity"].mean()
 
-            # Example: Total Safety Stock Value by Item Class (Bar Chart)
-            st.write("#### Total Safety Stock Value by Item Class")
-            ss_value_by_class = safety_stock_results_df.groupby('item_class')['total_safety_stock_value'].sum().sort_values(ascending=False)
-            st.bar_chart(ss_value_by_class, use_container_width=True)
+    cm = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"]
+    stats["avg_days_between_failures_per_customer"] = cm.groupby("customer_name")["txn_date"].apply(avg_days_between)
+    stats["failure_count_per_customer"]    = cm.groupby("customer_name").size()
+    stats["customer_sku_diversity"]        = cleaned_df.groupby("customer_name")["item_sku"].nunique()
 
-            # Example: Count of Items by Target Service Level (Z-score) (Bar Chart)
-            st.write("#### Count of Items by Target Service Level (Z-score)")
-            item_count_by_z = safety_stock_results_df['item_specific_z'].value_counts().sort_index()
-            st.bar_chart(item_count_by_z, use_container_width=True)
+    sku_counts = cleaned_df.groupby(["customer_name","item_sku"]).size()
+    repeats = sku_counts[sku_counts>1].groupby("customer_name").size()
+    stats["customer_repeat_rate"]          = repeats.div(stats["customer_sku_diversity"]).fillna(0)
 
-        with tab_data:
-            st.subheader("Detailed Reports")
-            st.write("Browse and filter through all generated KPI tables.")
+    # bleed score
+    max_cost  = stats["total_customer_cost"].max()  or 1
+    max_mloss = stats["customer_avg_margin_loss"].max() or 1
+    stats["customer_bleed_score"] = (
+        (stats["total_customer_cost"]/max_cost) +
+        stats["customer_repeat_rate"] +
+        (stats["customer_avg_margin_loss"]/max_mloss)
+    ) / 3
 
-            report_options = list(output_paths.values())
-            selected_report_display_name = st.selectbox(
-                "Select a Report to View", 
-                report_options, 
-                help="Choose which detailed KPI report you'd like to examine."
-            )
+    us = cleaned_df[cleaned_df["fulfillment_country"]=="US"].groupby("customer_name").size()
+    stats["customer_fulfillment_mix"] = us.div(stats["customer_transaction_count"]).fillna(0)
 
-            selected_report_filename = next(key for key, value in output_paths.items() if value == selected_report_display_name)
-            
-            if selected_report_filename in st.session_state.generated_dfs:
-                current_df_to_display = st.session_state.generated_dfs[selected_report_filename]
+    state_bleed = cleaned_df.groupby(["customer_name","ship_state"])["net_cost_impact"].sum()
+    stats["customer_state_bleed"] = state_bleed.groupby("customer_name").idxmax().apply(lambda x: x[1])
 
-                if not current_df_to_display.empty:
-                    st.write(f"#### {selected_report_display_name} Table")
-                    
-                    st.info("Use the filters below to refine your view of the table data.")
-                    
-                    # Filters for the table (Bloomberg style interaction)
-                    filter_cols = ['item_sku', 'fulfillment_loc', 'item_class', 'customer_name', 'ship_state', 'month', 'customer_category', 'item_type']
-                    available_filter_cols = [col for col in filter_cols if col in current_df_to_display.columns]
+    cust = cust.reset_index().merge(stats.reset_index(), on="customer_name", how="left")
+    cust.to_csv(cust_csv_path, index=False)
+    return cust
 
-                    current_filtered_df = current_df_to_display.copy()
+def generate_location_kpi_table(cleaned_df: pd.DataFrame,
+                                 loc_csv_path: str,
+                                 as_of: Optional[datetime]=None) -> pd.DataFrame:
+    if as_of is None:
+        as_of = datetime.now()
+    start = as_of.replace(month=1, day=1)
+    last90 = as_of - timedelta(days=90)
+    days_ytd = max((as_of - start).days, 1)
 
-                    for col in available_filter_cols:
-                        if col == 'item_sku' or col == 'customer_name': # Text input for search
-                            search_term = st.text_input(f"Search by {col} (partial match)", key=f"filter_search_{selected_report_filename}_{col}", help=f"Enter text to filter {col}.")
-                            if search_term:
-                                current_filtered_df = current_filtered_df[
-                                    current_filtered_df[col].astype(str).str.contains(search_term, case=False, na=False)
-                                ]
-                        else: # Selectbox for categories
-                            all_unique_values = ['All'] + sorted(current_df_to_display[col].unique().tolist())
-                            selected_value = st.selectbox(f"Filter by {col}", all_unique_values, key=f"filter_select_{selected_report_filename}_{col}", help=f"Select a specific {col} to filter.")
-                            if selected_value != 'All':
-                                current_filtered_df = current_filtered_df[current_filtered_df[col] == selected_value]
-                    
-                    st.write(f"Displaying {len(current_filtered_df)} of {len(current_df_to_display)} entries.")
-                    st.dataframe(current_filtered_df, use_container_width=True)
+    df_ytd = cleaned_df[cleaned_df["txn_date"] >= start]
+    df_90d = cleaned_df[cleaned_df["txn_date"] >= last90]
 
-                    # --- Download Button for Current Report ---
-                    @st.cache_data
-                    def convert_df_to_csv(df):
-                        return df.to_csv(index=False).encode('utf-8')
+    def agg(df, label):
+        return df.groupby("fulfillment_loc").agg(
+            **{f"{label}_claims": ("doc_num","count"),
+               f"{label}_net_cost":("net_cost_impact","sum")}
+        )
 
-                    csv_data = convert_df_to_csv(current_df_to_display)
-                    st.download_button(
-                        label=f"Download {selected_report_display_name} as CSV",
-                        data=csv_data,
-                        file_name=selected_report_filename,
-                        mime="text/csv",
-                        key=f"download_{selected_report_filename}"
-                    )
-                else:
-                    st.info(f"The selected report '{selected_report_display_name}' is empty. Please ensure data is available for this report type.")
-            else:
-                st.info("No report selected or report not generated yet. Please run the analysis first.")
+    loc = agg(df_ytd, "YTD").join(agg(df_90d, "90D"), how="outer").fillna(0)
 
-        with tab_visuals:
-            st.subheader("Advanced Safety Stock Visualizations")
-            st.write("Explore interactive charts to gain deeper insights into safety stock data.")
+    stats = pd.DataFrame(index=cleaned_df["fulfillment_loc"].unique(), dtype=float)
+    stats.index.name = "fulfillment_loc"
+    stats["total_fulfillment_cost"]      = cleaned_df.groupby("fulfillment_loc")["net_cost_impact"].sum()
+    stats["total_units_fulfilled"]       = cleaned_df.groupby("fulfillment_loc")["item_qty"].sum()
+    stats["gl_transaction_count_by_loc"] = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("fulfillment_loc").size()
+    stats["avg_margin_loss_per_unit_by_loc"] = cleaned_df.groupby("fulfillment_loc")["margin_loss_intensity"].mean()
+    tx_count = cleaned_df.groupby("fulfillment_loc").size()
+    stats["bleed_density_by_loc"]        = stats["total_fulfillment_cost"] / tx_count.replace(0,1)
+    stats["fulfillment_to_state_map"]    = cleaned_df.groupby("fulfillment_loc")["ship_state"].nunique()
+    # delivery risk
+    state_cost = cleaned_df.groupby("ship_state")["net_cost_impact"].sum()
+    state_risk = (state_cost.abs()/state_cost.abs().max()).to_dict()
+    method_counts = cleaned_df["ship_method"].value_counts()
+    method_risk = (method_counts/method_counts.max()).to_dict()
+    # Ensure 'delivery_risk_score' is calculated on 'cleaned_df' for proper mean aggregation later
+    cleaned_df_copy_for_risk = cleaned_df.copy() # Avoid modifying original cleaned_df for later steps
+    cleaned_df_copy_for_risk["delivery_risk_score"] = (
+        cleaned_df_copy_for_risk["ship_state"].map(state_risk).fillna(0) + # Added .fillna(0)
+        cleaned_df_copy_for_risk["ship_method"].map(method_risk).fillna(0) # Added .fillna(0)
+    ) / 2
+    stats["avg_delivery_risk_score"]     = cleaned_df_copy_for_risk.groupby("fulfillment_loc")["delivery_risk_score"].mean()
+    stats["fulfillment_customer_footprint"] = cleaned_df.groupby("fulfillment_loc")["customer_name"].nunique()
+    stats["location_cost_velocity"]      = stats["total_fulfillment_cost"] / days_ytd
+    inv = cleaned_df[cleaned_df["txn_type"]=="Invoice"].copy()
+    inv["margin_recovery"] = inv["unit_margin_impact"] * inv["item_qty"]
+    rec = inv.groupby("fulfillment_loc")["margin_recovery"].sum()
+    stats["fulfillment_margin_recovery_rate"] = rec / stats["total_fulfillment_cost"].abs().replace(0,1)
+    stats["fulfillment_bleed_index"]     = stats["total_fulfillment_cost"].abs() / stats["total_units_fulfilled"].replace(0,1)
 
-            # 1. Scatter Plot: Risk Score vs. Total Safety Stock Value
-            # Ensure data exists and relevant columns are present
-            if not safety_stock_results_df.empty and \
-               'S_score' in safety_stock_results_df.columns and \
-               'total_safety_stock_value' in safety_stock_results_df.columns and \
-               'item_class' in safety_stock_results_df.columns and \
-               'item_sku' in safety_stock_results_df.columns and \
-               'fulfillment_loc' in safety_stock_results_df.columns and \
-               'safety_stock_qty' in safety_stock_results_df.columns and \
-               'Reorder_Point' in safety_stock_results_df.columns:
-                
-                st.write("#### Risk Score vs. Total Safety Stock Value by Item Class")
-                st.info("Hover over points for details. Adjust size based on Safety Stock Quantity.")
-                
-                # Ensure 'total_safety_stock_value' is numeric and handle potential NaNs before plotting
-                plot_df_scatter = safety_stock_results_df.dropna(subset=['S_score', 'total_safety_stock_value', 'safety_stock_qty']).copy()
-                
-                if not plot_df_scatter.empty:
-                    fig_scatter = px.scatter(
-                        plot_df_scatter,
-                        x="S_score",
-                        y="total_safety_stock_value",
-                        color="item_class", # Color by item class
-                        hover_name="item_sku", # Show SKU on hover
-                        hover_data=['fulfillment_loc', 'safety_stock_qty', 'Reorder_Point'], # Additional data on hover
-                        size='safety_stock_qty', # Size bubbles by safety stock quantity
-                        log_y=True, # Log scale for better visibility of cost differences
-                        title="Safety Stock Risk (S_score) vs. Value (log scale)",
-                        labels={
-                            "S_score": "Composite Safety Score (Higher = More Risk)",
-                            "total_safety_stock_value": "Total Safety Stock Value ($)",
-                            "item_class": "Item Class"
-                        }
-                    )
-                    fig_scatter.update_layout(height=500) # Set a fixed height for consistency
-                    st.plotly_chart(fig_scatter, use_container_width=True)
-                else:
-                    st.warning("No data available for the Risk Score vs. Total Safety Stock Value scatter plot after cleaning.")
-            else:
-                st.info("Cannot generate Risk Score vs. Value scatter plot. Missing required columns or empty data after analysis.")
+    loc = loc.reset_index().merge(stats.reset_index(), on="fulfillment_loc", how="left")
+    loc.to_csv(loc_csv_path, index=False)
+    return loc
 
+def generate_state_kpi_table(cleaned_df: pd.DataFrame,
+                             state_csv_path: str,
+                             as_of: Optional[datetime]=None) -> pd.DataFrame:
+    if as_of is None:
+        as_of = datetime.now()
+    start = as_of.replace(month=1, day=1)
+    last90 = as_of - timedelta(days=90)
 
-            # 2. Treemap: Safety Stock Value Breakdown
-            # Ensure data exists and 'total_safety_stock_value' is present and > 0
-            if not safety_stock_results_df.empty and \
-               'total_safety_stock_value' in safety_stock_results_df.columns and \
-               'fulfillment_loc' in safety_stock_results_df.columns and \
-               'item_class' in safety_stock_results_df.columns and \
-               'item_sku' in safety_stock_results_df.columns:
-                
-                st.write("#### Safety Stock Value Breakdown by Location and Item Class")
-                st.info("Click on a box to drill down. Double-click to zoom out.")
-                
-                # Filter out rows where total_safety_stock_value is zero or NaN, as these break treemap
-                plot_df_treemap = safety_stock_results_df[safety_stock_results_df['total_safety_stock_value'] > 0].copy()
-                plot_df_treemap.loc[:, 'total_safety_stock_value'] = plot_df_treemap['total_safety_stock_value'].fillna(0)
-                
-                if not plot_df_treemap.empty:
-                    fig_treemap = px.treemap(
-                        plot_df_treemap,
-                        path=[px.Constant("All Inventory"), 'fulfillment_loc', 'item_class', 'item_sku'],
-                        values='total_safety_stock_value',
-                        color='total_safety_stock_value', # Color intensity by value
-                        hover_data=['safety_stock_qty', 'S_score'], # Add more hover info
-                        title="Hierarchical View of Total Safety Stock Value Distribution"
-                    )
-                    fig_treemap.update_layout(margin = dict(t=50, l=25, r=25, b=25), height=600) # Adjust margins and set height
-                    st.plotly_chart(fig_treemap, use_container_width=True)
-                else:
-                    st.warning("No data with positive 'Total Safety Stock Value' available for the Treemap after cleaning.")
-            else:
-                st.info("Cannot generate Safety Stock Value Treemap. Missing required columns or no positive safety stock values after analysis.")
+    df_ytd = cleaned_df[cleaned_df["txn_date"] >= start]
+    df_90d = cleaned_df[cleaned_df["txn_date"] >= last90]
 
-            # 3. NEW: Interactive Heatmap for Service Center KPIs
-            service_center_df = st.session_state.generated_dfs.get('service_center_kpi_output.csv')
-            
-            if service_center_df is not None and not service_center_df.empty:
-                st.write("#### Service Center Performance Heatmap")
-                st.info("This heatmap shows the relative intensity of various KPIs for each Service Center (Customer Name). Brighter colors indicate higher values after normalization.")
+    def agg(df, label):
+        return df.groupby("ship_state").agg(
+            **{f"{label}_claims":("doc_num","count"),
+               f"{label}_net_cost":("net_cost_impact","sum")}
+        )
 
-                # Debugging: Show columns of the service_center_df
-                with st.expander("Debug Service Center Data Columns"):
-                    st.write("Columns in service_center_df:", service_center_df.columns.tolist())
-                    st.write("Head of service_center_df:", service_center_df.head())
+    state = agg(df_ytd, "YTD").join(agg(df_90d, "90D"), how="outer").fillna(0)
 
+    stats = pd.DataFrame(index=cleaned_df["ship_state"].unique(), dtype=float)
+    stats.index.name = "ship_state"
+    stats["state_transaction_count"]    = cleaned_df.groupby("ship_state").size()
+    stats["state_gl_transaction_count"] = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("ship_state").size()
+    stats["state_credit_memo_count"]    = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("ship_state").size()
+    stats["state_invoice_count"]        = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("ship_state").size()
+    stats["total_state_cost"]           = cleaned_df.groupby("ship_state")["net_cost_impact"].sum()
+    shipped = cleaned_df.groupby("ship_state")["item_qty"].sum().replace(0,1)
+    stats["avg_cost_per_unit_by_state"] = stats["total_state_cost"] / shipped
+    stats["bleed_density_by_state"]     = stats["total_state_cost"] / stats["state_transaction_count"].replace(0,1)
+    fails = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("ship_state")["item_qty"].sum()
+    stats["unit_failure_rate_by_state"] = fails.div(shipped)
+    stats["state_customer_count"]       = cleaned_df.groupby("ship_state")["customer_name"].nunique()
+    stats["avg_margin_loss_by_state"]   = cleaned_df.groupby("ship_state")["margin_loss_intensity"].mean()
+    cust_claims = cleaned_df.groupby(["ship_state","customer_name"])["doc_num"].count()
+    repeats = cust_claims[cust_claims>1].groupby("ship_state").size()
+    stats["repeat_claim_rate_by_state"] = repeats.div(stats["state_customer_count"].replace(0,1)).fillna(0)
+    thresh = stats["bleed_density_by_state"].mean() + stats["bleed_density_by_state"].std()
+    stats["high_risk_state_flag"]       = stats["bleed_density_by_state"] > thresh
 
-                # Select numerical columns for the heatmap
-                potential_heatmap_kpis = [
-                    'total_service_center_cost',
-                    'total_labor_cost',
-                    'total_mileage_cost',
-                    'avg_cost_per_visit',
-                    'avg_units_serviced',
-                    'bleed_per_unit',
-                    'avg_margin_loss_per_visit',
-                    'service_center_sku_diversity',
-                    'service_center_customer_repeats'
-                ]
-                
-                # Filter heatmap_kpis to only include columns actually present in service_center_df
-                available_heatmap_kpis = [col for col in potential_heatmap_kpis if col in service_center_df.columns]
+    state = state.reset_index().merge(stats.reset_index(), on="ship_state", how="left")
+    state.to_csv(state_csv_path, index=False)
+    return state
 
-                # Crucial check: Ensure 'customer_name' exists and there's at least one KPI for the heatmap
-                if 'customer_name' not in service_center_df.columns:
-                    st.warning("Heatmap: 'customer_name' column not found in service center data. Cannot generate heatmap.")
-                elif not available_heatmap_kpis:
-                    st.warning("Heatmap: No relevant KPI columns found in service center data for the heatmap. Please check your data or selected KPIs.")
-                else:
-                    # Filter for only relevant KPI columns and drop rows with all NaN for selected KPIs
-                    # Also ensure customer_name is not NaN
-                    heatmap_df = service_center_df[['customer_name'] + available_heatmap_kpis].copy()
-                    heatmap_df = heatmap_df.dropna(subset=available_heatmap_kpis, how='all')
-                    heatmap_df = heatmap_df.dropna(subset=['customer_name']) # Drop rows where customer_name is NaN
+def generate_monthly_kpi_table(cleaned_df: pd.DataFrame,
+                               monthly_csv_path: str,
+                               as_of: Optional[datetime]=None) -> pd.DataFrame:
+    df = cleaned_df.copy()
+    if as_of is None:
+        as_of = datetime.now()
+    df["month"] = df["txn_date"].dt.to_period("M").astype(str)
+    df["value_transacted"] = df["item_rate"] * df["item_qty"]
 
-                    if not heatmap_df.empty:
-                        # Set customer_name as index for easier matrix formation
-                        heatmap_df = heatmap_df.set_index('customer_name')
-                        
-                        # Handle infinities and large numbers, replace with NaN then impute or drop
-                        # Also convert columns to numeric, coercing errors
-                        for col in heatmap_df.columns:
-                            if pd.api.types.is_numeric_dtype(heatmap_df[col]):
-                                heatmap_df[col] = pd.to_numeric(heatmap_df[col], errors='coerce')
-                                heatmap_df[col] = heatmap_df[col].replace([np.inf, -np.inf], np.nan)
-                        
-                        # Fill remaining NaNs with 0 for heatmap visualization (or mean/median if preferred)
-                        # This is important after type conversion and inf handling
-                        heatmap_df = heatmap_df.fillna(0)
+    monthly = df.groupby("month").agg(
+        monthly_transaction_count=("doc_num","count"),
+        monthly_gl_transaction_count=("GL_tag",lambda x:(x=="GL").sum()),
+        monthly_credit_memo_count=("txn_type",lambda x:(x=="Credit Memo").sum()),
+        monthly_invoice_count=("txn_type",lambda x:(x=="Invoice").sum()),
+        monthly_total_cost=("net_cost_impact","sum"),
+        monthly_total_units=("item_qty","sum"),
+        total_value_transacted=("value_transacted","sum")
+    )
+    monthly["monthly_avg_cost_per_unit"] = monthly["monthly_total_cost"] / monthly["monthly_total_units"].replace(0,1)
+    monthly["monthly_margin_bleed_rate"] = monthly["monthly_total_cost"] / monthly["total_value_transacted"].replace(0,1)
 
-                        # Check if all numeric columns are now zero (can happen after fillna)
-                        if (heatmap_df[available_heatmap_kpis].sum().sum() == 0) and not heatmap_df.empty:
-                             st.warning("Heatmap: All selected KPI values are zero after processing. Heatmap may not be meaningful.")
-                        
-                        # Only proceed with scaling if there's actual non-zero data to scale
-                        # Also check for division by zero in scaler (if a column is all zeros, it might cause issues)
-                        # We specifically filter to ensure the columns exist in heatmap_df before scaling.
-                        cols_to_scale = [col for col in available_heatmap_kpis if col in heatmap_df.columns and heatmap_df[col].nunique() > 1]
-                        
-                        if not heatmap_df.empty and cols_to_scale: # Check if there are columns to scale
-                            scaler = MinMaxScaler()
-                            # Scale only the columns that have variance
-                            heatmap_df[cols_to_scale] = scaler.fit_transform(heatmap_df[cols_to_scale])
-                            
-                            # For columns that were all zeros and thus not scaled, ensure they are still zero or handled
-                            for col in available_heatmap_kpis:
-                                if col not in cols_to_scale:
-                                    if col in heatmap_df.columns:
-                                        heatmap_df[col] = 0 # Ensure they remain zero if they were already zero
+    repeat = df.groupby(["month","customer_name"]).size().groupby("month").apply(lambda x: (x>1).sum())
+    monthly["monthly_repeat_customers"] = repeat
 
-                            fig_heatmap = px.imshow(
-                                heatmap_df[available_heatmap_kpis], # Plot only the available and (potentially) scaled KPIs
-                                x=available_heatmap_kpis, # X-axis uses the available KPI names
-                                y=heatmap_df.index,
-                                color_continuous_scale=px.colors.sequential.Viridis, # A good sequential color scale
-                                title="Normalized Service Center KPI Heatmap",
-                                labels={
-                                    "x": "KPI",
-                                    "y": "Service Center (Customer Name)",
-                                    "color": "Normalized Value"
-                                }
-                            )
-                            
-                            fig_heatmap.update_xaxes(side="top") # Move KPI labels to top
-                            fig_heatmap.update_layout(height=max(600, len(heatmap_df.index) * 20), width=900) # Dynamic height based on number of customers
-                            
-                            st.plotly_chart(fig_heatmap, use_container_width=True)
-                        elif not heatmap_df.empty:
-                            st.warning("Heatmap: All selected KPI columns have no variance (all values are the same or zero). Heatmap may not be meaningful as normalization cannot be applied effectively.")
-                        else:
-                            st.warning("No valid data available for the Service Center Performance Heatmap after cleaning and filtering.")
-                    else:
-                        st.warning("No valid data available for the Service Center Performance Heatmap after cleaning and filtering.")
-            else:
-                st.info("Service Center KPI data not available or is empty. Run analysis first.")
+    state_cost = df.groupby("ship_state")["net_cost_impact"].sum()
+    state_tx   = df.groupby("ship_state").size()
+    bleed_den  = state_cost / state_tx.replace(0,1)
+    thresh     = bleed_den.mean() + bleed_den.std()
+    flags      = bleed_den[bleed_den>thresh].index
+    high_risk  = df[df["ship_state"].isin(flags)].groupby("month").size()
+    monthly["monthly_high_risk_state_events"] = high_risk
 
-# Close the main app-container div
-st.markdown('</div>', unsafe_allow_html=True)
+    sku_loss = df.groupby(["month","item_sku"])["net_cost_impact"].sum()
+    leader = sku_loss.groupby("month").idxmax().apply(lambda x:x[1])
+    monthly["monthly_sku_bleed_leader"] = leader
+
+    state_risk_dict    = (state_cost.abs()/state_cost.abs().max()).to_dict()
+    method_risk_dict = (df["ship_method"].value_counts()/df["ship_method"].value_counts().max()).to_dict()
+    df["delivery_risk_score"] = (df["ship_state"].map(state_risk_dict).fillna(0) + df["ship_method"].map(method_risk_dict).fillna(0)) / 2 # Added .fillna(0)
+    monthly["monthly_fulfillment_risk_score"] = df.groupby("month")["delivery_risk_score"].mean()
+
+    monthly = monthly.fillna({
+        "monthly_repeat_customers":0,
+        "monthly_high_risk_state_events":0,
+        "monthly_sku_bleed_leader":"",
+        "monthly_fulfillment_risk_score":0
+    }).drop(columns=["total_value_transacted"])
+    monthly.reset_index().to_csv(monthly_csv_path, index=False)
+    return monthly
+
+def generate_category_kpi_table(cleaned_df: pd.DataFrame,
+                                 category_csv_path: str) -> pd.DataFrame:
+    stats = pd.DataFrame(index=cleaned_df["customer_category"].unique(), dtype=float)
+    stats.index.name = "customer_category"
+    stats["category_transaction_count"]    = cleaned_df.groupby("customer_category").size()
+    stats["category_gl_transaction_count"] = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("customer_category").size()
+    stats["total_category_cost"]           = cleaned_df.groupby("customer_category")["net_cost_impact"].sum()
+    stats["avg_cost_per_unit_by_category"] = stats["total_category_cost"] / cleaned_df.groupby("customer_category")["item_qty"].sum().replace(0,1)
+    stats["avg_margin_loss_by_category"]   = cleaned_df.groupby("customer_category")["margin_loss_intensity"].mean()
+    stats["category_bleed_rate"]           = stats["total_category_cost"] / stats["category_transaction_count"].replace(0,1)
+    stats["avg_units_per_claim"]           = cleaned_df.groupby("customer_category")["item_qty"].sum() / stats["category_transaction_count"].replace(0,1)
+    cc = cleaned_df.groupby(["customer_category","customer_name"])["doc_num"].count()
+    repeats = cc[cc>1].groupby("customer_category").size()
+    stats["repeat_claim_rate_by_category"] = repeats.div(cleaned_df.groupby("customer_category")["customer_name"].nunique()).fillna(0)
+    stats["category_customer_count"]       = cleaned_df.groupby("customer_category")["customer_name"].nunique()
+    us = cleaned_df[cleaned_df["fulfillment_country"]=="US"].groupby("customer_category").size()
+    stats["category_fulfillment_mix"]      = us.div(stats["category_transaction_count"]).fillna(0)
+    sku_cost = cleaned_df.groupby(["customer_category","item_sku"])["net_cost_impact"].sum()
+    leader = sku_cost.groupby("customer_category").idxmax().apply(lambda x:x[1])
+    stats["category_top_bleed_sku"]        = leader
+
+    stats.reset_index().to_csv(category_csv_path, index=False)
+    return stats
+
+def generate_item_class_kpi_table(cleaned_df: pd.DataFrame,
+                                   class_csv_path: str) -> pd.DataFrame:
+    stats = pd.DataFrame(index=cleaned_df["item_class"].unique(), dtype=float)
+    stats.index.name = "item_class"
+    stats["item_class_transaction_count"]   = cleaned_df.groupby("item_class").size()
+    stats["item_class_gl_transaction_count"]= cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("item_class").size()
+    stats["item_class_credit_memo_count"]   = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("item_class").size()
+    stats["item_class_invoice_count"]       = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("item_class").size()
+    stats["item_class_total_cost"]          = cleaned_df.groupby("item_class")["net_cost_impact"].sum()
+    stats["item_class_avg_cost_per_unit"]   = stats["item_class_total_cost"] / cleaned_df.groupby("item_class")["item_qty"].sum().replace(0,1)
+    fails = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("item_class")["item_qty"].sum()
+    ship  = cleaned_df.groupby("item_class")["item_qty"].sum().replace(0,1)
+    stats["item_class_unit_failure_rate"]   = fails.div(ship)
+    stats["item_class_bleed_density"]       = stats["item_class_total_cost"] / stats["item_class_transaction_count"].replace(0,1)
+    stats["item_class_margin_efficiency"]   = cleaned_df.groupby("item_class")["margin_efficiency_ratio"].mean()
+    sku_loss = cleaned_df.groupby(["item_class","item_sku"])["net_cost_impact"].sum()
+    stats["item_class_top_bleed_sku"]       = sku_loss.groupby("item_class").idxmax().apply(lambda x:x[1])
+    cm = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"]
+    stats["item_class_avg_days_to_failure"] = cm.groupby("item_class")["txn_date"].apply(avg_days_between)
+    cc = cleaned_df.groupby(["item_class","customer_name"])["doc_num"].count()
+    reps = cc[cc>1].groupby("item_class").size()
+    stats["item_class_repeat_customer_count"]= reps
+    us = cleaned_df[cleaned_df["fulfillment_country"]=="US"].groupby("item_class").size()
+    stats["item_class_fulfillment_mix"]      = us.div(stats["item_class_transaction_count"]).fillna(0)
+
+    stats.reset_index().to_csv(class_csv_path, index=False)
+    return stats
+
+def generate_item_type_kpi_table(cleaned_df: pd.DataFrame,
+                                  type_csv_path: str) -> pd.DataFrame:
+    stats = pd.DataFrame(index=cleaned_df["item_type"].unique(), dtype=float)
+    stats.index.name = "item_type"
+    stats["item_type_transaction_count"]    = cleaned_df.groupby("item_type").size()
+    stats["item_type_gl_transaction_count"]= cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("item_type").size()
+    stats["item_type_credit_memo_count"]    = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("item_type").size()
+    stats["item_type_invoice_count"]        = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("item_type").size()
+    stats["item_type_total_cost"]           = cleaned_df.groupby("item_type")["net_cost_impact"].sum()
+    stats["item_type_avg_cost_per_unit"]    = stats["item_type_total_cost"] / cleaned_df.groupby("item_type")["item_qty"].sum().replace(0,1)
+    fails = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("item_type")["item_qty"].sum()
+    ship  = cleaned_df.groupby("item_type")["item_qty"].sum().replace(0,1)
+    stats["item_type_unit_failure_rate"]    = fails.div(ship)
+    stats["item_type_bleed_density"]        = stats["item_type_total_cost"] / stats["item_type_transaction_count"].replace(0,1)
+    stats["item_type_margin_efficiency"]    = cleaned_df.groupby("item_type")["margin_efficiency_ratio"].mean()
+    sku_loss = cleaned_df.groupby(["item_type","item_sku"])["net_cost_impact"].sum()
+    stats["item_type_top_bleed_sku"]        = sku_loss.groupby("item_type").idxmax().apply(lambda x:x[1])
+    cm = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"]
+    stats["item_type_avg_days_to_failure"] = cm.groupby("item_type")["txn_date"].apply(avg_days_between)
+    cc = cleaned_df.groupby(["item_type","customer_name"])["doc_num"].count()
+    reps = cc[cc>1].groupby("item_type").size()
+    stats["item_type_repeat_customer_count"] = reps
+    us = cleaned_df[cleaned_df["fulfillment_country"]=="US"].groupby("item_type").size()
+    stats["item_type_fulfillment_mix"]       = us.div(stats["item_type_transaction_count"]).fillna(0)
+
+    stats.reset_index().to_csv(type_csv_path, index=False)
+    return stats
+
+def generate_service_center_kpi_table(cleaned_df: pd.DataFrame,
+                                       center_csv_path: str) -> pd.DataFrame:
+    stats = pd.DataFrame(index=cleaned_df["customer_name"].unique(), dtype=float)
+    stats.index.name = "customer_name"
+    stats["service_center_transaction_count"]    = cleaned_df.groupby("customer_name").size()
+    stats["service_center_gl_transaction_count"] = cleaned_df[cleaned_df["GL_tag"]=="GL"].groupby("customer_name").size()
+    stats["service_center_credit_memo_count"]    = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"].groupby("customer_name").size()
+    stats["service_center_invoice_count"]        = cleaned_df[cleaned_df["txn_type"]=="Invoice"].groupby("customer_name").size()
+    stats["total_service_center_cost"]           = cleaned_df.groupby("customer_name")["net_cost_impact"].sum()
+    # labor/mileage SKUs - Ensure these columns are always created and aligned
+    labor = cleaned_df[cleaned_df["item_sku"]=="SCLAB"].groupby("customer_name")["net_cost_impact"].sum()
+    mile  = cleaned_df[cleaned_df["item_sku"]=="SCMIL"].groupby("customer_name")["net_cost_impact"].sum()
+    
+    # Use reindex and fillna(0) to ensure these columns exist for all customers in 'stats'
+    # This prevents KeyError if 'SCLAB' or 'SCMIL' are not present for any customer or at all
+    stats["total_labor_cost"]   = labor.reindex(stats.index).fillna(0)
+    stats["total_mileage_cost"] = mile.reindex(stats.index).fillna(0)
+
+    stats["avg_cost_per_visit"] = stats["total_service_center_cost"] / stats["service_center_transaction_count"].replace(0,1)
+    total_units = cleaned_df.groupby("customer_name")["item_qty"].sum()
+    stats["avg_units_serviced"]          = total_units / stats["service_center_transaction_count"].replace(0,1)
+    stats["bleed_per_unit"]              = stats["total_service_center_cost"] / total_units.replace(0,1)
+    stats["avg_margin_loss_per_visit"]   = cleaned_df.groupby("customer_name")["margin_loss_intensity"].mean()
+    stats["service_center_sku_diversity"]= cleaned_df.groupby("customer_name")["item_sku"].nunique()
+    cc = cleaned_df.groupby(["customer_name","item_sku"])["doc_num"].count()
+    stats["service_center_customer_repeats"] = cc.groupby("customer_name").apply(lambda g:(g>1).sum())
+    cm = cleaned_df[cleaned_df["txn_type"]=="Credit Memo"]
+    stats["return_window_avg_days"] = cm.groupby("customer_name")["txn_date"].apply(avg_days_between)
+    us = cleaned_df[cleaned_df["fulfillment_country"]=="US"].groupby("customer_name").size()
+    stats["fulfillment_mix_by_center"] = us.div(stats["service_center_transaction_count"]).fillna(0)
+    thr = stats["bleed_per_unit"].mean() + stats["bleed_per_unit"].std()
+    stats["service_center_qc_flag"] = stats["bleed_per_unit"] > thr
+
+    stats.reset_index().to_csv(center_csv_path, index=False)
+    return stats
