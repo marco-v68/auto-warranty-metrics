@@ -1,7 +1,9 @@
+%%writefile streamlit_app.py
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import os # Import os for file operations
+import os
+import plotly.express as px # ADDED FOR ADVANCED VISUALIZATIONS
 
 # Import your functions from the separate files
 from data_processing import (
@@ -97,7 +99,7 @@ if st.button("Run All Analysis & Generate Reports"):
         st.session_state.generated_dfs['customer_kpi_output.csv'] = generate_customer_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[2], as_of=as_of_datetime)
         st.session_state.generated_dfs['location_kpi_output.csv'] = generate_location_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[3], as_of=as_of_datetime)
         st.session_state.generated_dfs['state_kpi_output.csv'] = generate_state_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[4], as_of=as_of_datetime)
-        st.session_state.generated_dfs['monthly_kpi_output.csv'] = generate_monthly_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[5], as_of=as_of_datetime) # Corrected variable name
+        st.session_state.generated_dfs['monthly_kpi_output.csv'] = generate_monthly_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[5], as_of=as_of_datetime)
         st.session_state.generated_dfs['category_kpi_output.csv'] = generate_category_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[6])
         st.session_state.generated_dfs['item_class_kpi_output.csv'] = generate_item_class_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[7])
         st.session_state.generated_dfs['item_type_kpi_output.csv'] = generate_item_type_kpi_table(st.session_state.cleaned_df, list(output_paths.keys())[8])
@@ -197,3 +199,48 @@ if st.session_state.get('generated_dfs') and not st.session_state.generated_dfs[
     st.write("Count of Items by Target Service Level (Z-score):")
     item_count_by_z = safety_stock_results_df['item_specific_z'].value_counts().sort_index()
     st.bar_chart(item_count_by_z)
+
+    # --- NEW: Plotly Express Visualizations ---
+    st.subheader("Interactive Safety Stock Visualizations")
+
+    # 1. Scatter Plot: Risk Score vs. Total Safety Stock Value
+    if not safety_stock_results_df.empty and \
+       'S_score' in safety_stock_results_df.columns and \
+       'total_safety_stock_value' in safety_stock_results_df.columns:
+        
+        st.write("#### Risk Score vs. Total Safety Stock Value by Item Class")
+        fig_scatter = px.scatter(
+            safety_stock_results_df,
+            x="S_score",
+            y="total_safety_stock_value",
+            color="item_class", # Color by item class
+            hover_name="item_sku", # Show SKU on hover
+            hover_data=['fulfillment_loc', 'safety_stock_qty', 'Reorder_Point'], # Additional data on hover
+            size='safety_stock_qty', # Size bubbles by safety stock quantity
+            log_y=True, # Log scale for better visibility of cost differences
+            title="Safety Stock Risk (S_score) vs. Value (log scale)"
+        )
+        fig_scatter.update_layout(xaxis_title="Composite Safety Score (Risk)",
+                                  yaxis_title="Total Safety Stock Value (log scale)")
+        st.plotly_chart(fig_scatter, use_container_width=True)
+    else:
+        st.info("Cannot generate Risk Score vs. Value scatter plot. Missing required columns or empty data.")
+
+
+    # 2. Treemap: Safety Stock Value Breakdown
+    if not safety_stock_results_df.empty and 'total_safety_stock_value' in safety_stock_results_df.columns:
+        st.write("#### Safety Stock Value Breakdown by Location and Item Class")
+        fig_treemap = px.treemap(
+            safety_stock_results_df,
+            path=[px.Constant("All Locations"), 'fulfillment_loc', 'item_class', 'item_sku'],
+            values='total_safety_stock_value',
+            color='total_safety_stock_value', # Color intensity by value
+            hover_data=['safety_stock_qty'],
+            title="Hierarchical View of Total Safety Stock Value"
+        )
+        fig_treemap.update_layout(margin = dict(t=50, l=25, r=25, b=25)) # Adjust margins
+        st.plotly_chart(fig_treemap, use_container_width=True)
+    else:
+        st.info("Cannot generate Safety Stock Value Treemap. Missing required columns or empty data.")
+
+
