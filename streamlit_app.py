@@ -6,6 +6,7 @@ import plotly.express as px # For advanced visualizations
 import plotly.graph_objects as go # For more control over heatmaps if needed
 from typing import Optional # Required for type hinting in data_processing
 from sklearn.preprocessing import MinMaxScaler # For heatmap data normalization
+import numpy as np # Import numpy for inf handling
 
 # Import your functions from the separate files
 # Ensure these files (data_processing.py, safety_stock_logic.py) are in your GitHub repo
@@ -423,8 +424,14 @@ if st.button("Run All Analysis & Generate Reports", help="Click to generate all 
                 st.write("#### Service Center Performance Heatmap")
                 st.info("This heatmap shows the relative intensity of various KPIs for each Service Center (Customer Name). Brighter colors indicate higher values after normalization.")
 
+                # Debugging: Show columns of the service_center_df
+                with st.expander("Debug Service Center Data Columns"):
+                    st.write("Columns in service_center_df:", service_center_df.columns.tolist())
+                    st.write("Head of service_center_df:", service_center_df.head())
+
+
                 # Select numerical columns for the heatmap
-                heatmap_kpis = [
+                potential_heatmap_kpis = [
                     'total_service_center_cost',
                     'total_labor_cost',
                     'total_mileage_cost',
@@ -436,50 +443,79 @@ if st.button("Run All Analysis & Generate Reports", help="Click to generate all 
                     'service_center_customer_repeats'
                 ]
                 
-                # Filter for only relevant KPI columns and drop rows with all NaN for selected KPIs
-                # Also ensure customer_name is not NaN
-                heatmap_df = service_center_df[['customer_name'] + [col for col in heatmap_kpis if col in service_center_df.columns]].copy()
-                heatmap_df = heatmap_df.dropna(subset=[col for col in heatmap_kpis if col in heatmap_df.columns], how='all')
-                heatmap_df = heatmap_df.dropna(subset=['customer_name'])
+                # Filter heatmap_kpis to only include columns actually present in service_center_df
+                available_heatmap_kpis = [col for col in potential_heatmap_kpis if col in service_center_df.columns]
 
-                if not heatmap_df.empty:
-                    # Set customer_name as index for easier matrix formation
-                    heatmap_df = heatmap_df.set_index('customer_name')
-                    
-                    # Handle infinities and large numbers, replace with NaN then impute or drop
-                    # Also convert columns to numeric, coercing errors
-                    for col in heatmap_df.columns:
-                        if pd.api.types.is_numeric_dtype(heatmap_df[col]):
-                            heatmap_df[col] = pd.to_numeric(heatmap_df[col], errors='coerce')
-                            heatmap_df[col] = heatmap_df[col].replace([np.inf, -np.inf], np.nan)
-                    
-                    # Fill remaining NaNs with 0 for heatmap visualization (or mean/median if preferred)
-                    heatmap_df = heatmap_df.fillna(0)
-
-                    # Normalize the data for consistent color scaling across different KPIs
-                    scaler = MinMaxScaler()
-                    normalized_data = scaler.fit_transform(heatmap_df)
-                    normalized_df = pd.DataFrame(normalized_data, columns=heatmap_df.columns, index=heatmap_df.index)
-
-                    fig_heatmap = px.imshow(
-                        normalized_df,
-                        x=normalized_df.columns,
-                        y=normalized_df.index,
-                        color_continuous_scale=px.colors.sequential.Viridis, # A good sequential color scale
-                        title="Normalized Service Center KPI Heatmap",
-                        labels={
-                            "x": "KPI",
-                            "y": "Service Center (Customer Name)",
-                            "color": "Normalized Value"
-                        }
-                    )
-                    
-                    fig_heatmap.update_xaxes(side="top") # Move KPI labels to top
-                    fig_heatmap.update_layout(height=max(600, len(normalized_df.index) * 20), width=900) # Dynamic height based on number of customers
-                    
-                    st.plotly_chart(fig_heatmap, use_container_width=True)
+                # Crucial check: Ensure 'customer_name' exists and there's at least one KPI for the heatmap
+                if 'customer_name' not in service_center_df.columns:
+                    st.warning("Heatmap: 'customer_name' column not found in service center data. Cannot generate heatmap.")
+                elif not available_heatmap_kpis:
+                    st.warning("Heatmap: No relevant KPI columns found in service center data for the heatmap. Please check your data or selected KPIs.")
                 else:
-                    st.warning("No valid data available for the Service Center Performance Heatmap after cleaning and filtering.")
+                    # Filter for only relevant KPI columns and drop rows with all NaN for selected KPIs
+                    # Also ensure customer_name is not NaN
+                    heatmap_df = service_center_df[['customer_name'] + available_heatmap_kpis].copy()
+                    heatmap_df = heatmap_df.dropna(subset=available_heatmap_kpis, how='all')
+                    heatmap_df = heatmap_df.dropna(subset=['customer_name']) # Drop rows where customer_name is NaN
+
+                    if not heatmap_df.empty:
+                        # Set customer_name as index for easier matrix formation
+                        heatmap_df = heatmap_df.set_index('customer_name')
+                        
+                        # Handle infinities and large numbers, replace with NaN then impute or drop
+                        # Also convert columns to numeric, coercing errors
+                        for col in heatmap_df.columns:
+                            if pd.api.types.is_numeric_dtype(heatmap_df[col]):
+                                heatmap_df[col] = pd.to_numeric(heatmap_df[col], errors='coerce')
+                                heatmap_df[col] = heatmap_df[col].replace([np.inf, -np.inf], np.nan)
+                        
+                        # Fill remaining NaNs with 0 for heatmap visualization (or mean/median if preferred)
+                        # This is important after type conversion and inf handling
+                        heatmap_df = heatmap_df.fillna(0)
+
+                        # Check if all numeric columns are now zero (can happen after fillna)
+                        if (heatmap_df[available_heatmap_kpis].sum().sum() == 0) and not heatmap_df.empty:
+                             st.warning("Heatmap: All selected KPI values are zero after processing. Heatmap may not be meaningful.")
+                        
+                        # Only proceed with scaling if there's actual non-zero data to scale
+                        # Also check for division by zero in scaler (if a column is all zeros, it might cause issues)
+                        # We specifically filter to ensure the columns exist in heatmap_df before scaling.
+                        cols_to_scale = [col for col in available_heatmap_kpis if col in heatmap_df.columns and heatmap_df[col].nunique() > 1]
+                        
+                        if not heatmap_df.empty and cols_to_scale: # Check if there are columns to scale
+                            scaler = MinMaxScaler()
+                            # Scale only the columns that have variance
+                            heatmap_df[cols_to_scale] = scaler.fit_transform(heatmap_df[cols_to_scale])
+                            
+                            # For columns that were all zeros and thus not scaled, ensure they are still zero or handled
+                            for col in available_heatmap_kpis:
+                                if col not in cols_to_scale:
+                                    if col in heatmap_df.columns:
+                                        heatmap_df[col] = 0 # Ensure they remain zero if they were already zero
+
+                            fig_heatmap = px.imshow(
+                                heatmap_df[available_heatmap_kpis], # Plot only the available and (potentially) scaled KPIs
+                                x=available_heatmap_kpis, # X-axis uses the available KPI names
+                                y=heatmap_df.index,
+                                color_continuous_scale=px.colors.sequential.Viridis, # A good sequential color scale
+                                title="Normalized Service Center KPI Heatmap",
+                                labels={
+                                    "x": "KPI",
+                                    "y": "Service Center (Customer Name)",
+                                    "color": "Normalized Value"
+                                }
+                            )
+                            
+                            fig_heatmap.update_xaxes(side="top") # Move KPI labels to top
+                            fig_heatmap.update_layout(height=max(600, len(heatmap_df.index) * 20), width=900) # Dynamic height based on number of customers
+                            
+                            st.plotly_chart(fig_heatmap, use_container_width=True)
+                        elif not heatmap_df.empty:
+                            st.warning("Heatmap: All selected KPI columns have no variance (all values are the same or zero). Heatmap may not be meaningful as normalization cannot be applied effectively.")
+                        else:
+                            st.warning("No valid data available for the Service Center Performance Heatmap after cleaning and filtering.")
+                    else:
+                        st.warning("No valid data available for the Service Center Performance Heatmap after cleaning and filtering.")
             else:
                 st.info("Service Center KPI data not available or is empty. Run analysis first.")
 
