@@ -1,6 +1,8 @@
-# auto-warranty-metrics
-Comprehensive Inventory &amp; Warranty Analytics (Automotive Division)
-streamlit
-pandas
-numpy
-plotly
+# Core Streamlit app dependencies
+streamlit==1.33.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.20.0
+# Include common build tools (sometimes necessary for certain packages)
+wheel
+setuptools
